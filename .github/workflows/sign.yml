@@ -1,0 +1,227 @@
+# Signing workflow for OSSign/fam007e--securepasswd_mgmt (source: fam007e/SecurePasswd_MGMT).
+#
+# SecurePasswd_MGMT is a C/C++ (Qt 6) password manager built with CMake and
+# vcpkg (x64-windows). The Windows output mirrors the windows-latest leg of
+# upstream's release.yml: a CPack NSIS installer.
+#
+# Differences from upstream, agreed in the initial review:
+#   - The vcpkg checkout is pinned to the manifest's builtin-baseline commit
+#     instead of an unpinned clone of microsoft/vcpkg master.
+#   - No actions/cache for vcpkg: the signing job builds from scratch.
+#   - Only the Windows installer is built; Linux/macOS packages are not signed.
+#
+# Signed: securepasswd_cli.exe and securepasswd_gui.exe (the project's own
+# code) before packaging, the NSIS uninstaller (through !uninstfinalize) and
+# the installer. Third-party DLLs (Qt, OpenSSL, curl, ...) are shipped as they are.
+#
+#   [DO NOT CHANGE]  the server or the review depends on it; keep it as is
+#   [CHANGE ME]     project specific; replace freely
+#   [OPTIONAL]  can be removed without affecting the server
+
+name: Sign release
+
+run-name: "Sign ${{ inputs.ref }} [${{ inputs.dispatch_id }}]"      # [DO NOT CHANGE]
+
+on:                                                                 # [DO NOT CHANGE] all four inputs
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or tag of the source repository as requested
+        required: true
+      sha:
+        description: Commit pinned by ossign-server; the build uses this, never the moving ref
+        required: true
+      release_name:
+        description: Name of the GitHub release to publish
+        required: true
+      dispatch_id:
+        description: Dispatch id assigned by ossign-server
+        required: true
+
+env:
+  # [DO NOT CHANGE] Repository variables. SOURCE_REPO and OSSIGN_SERVER are set
+  # automatically during onboarding; add OSSIGN_KEY (the key name on the
+  # server) under Settings → Secrets and variables → Actions → Variables.
+  SOURCE_REPO: ${{ vars.SOURCE_REPO }}
+  OSSIGN_SERVER: ${{ vars.OSSIGN_SERVER }}
+  OSSIGN_KEY: ${{ vars.OSSIGN_KEY }}
+
+# [DO NOT CHANGE] id-token: write gives the job its OIDC token (signing and the report fetch).
+# contents: write is only needed by the release step at the bottom.
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  # The review scans the pinned commit on the server (the ossign-scanner
+  # service) before this job's environment is released, so the workflow has
+  # no scanning job of its own.
+
+  sign:
+    runs-on: windows-latest                                      # [CHANGE ME] upstream's runner
+    timeout-minutes: 360                                         # [CHANGE ME] Qt from source via vcpkg is slow
+    environment: signing                                         # [DO NOT CHANGE]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out the pinned source commit                 # [DO NOT CHANGE]
+        shell: bash
+        run: |
+          git init src
+          cd src
+          git remote add origin "$SOURCE_REPO"
+          git fetch --depth 1 origin "${{ inputs.sha }}"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "${{ inputs.sha }}"
+
+      # [DO NOT CHANGE] Install the CLI and write its configuration once. Files are
+      # signed by the action steps below and, for the uninstaller, by makensis
+      # through the CLI. The CLI authenticates with the job's OIDC token, so no
+      # secret is involved.
+      - name: Install ossign
+        id: ossign
+        uses: ossign/ossign@main
+        with:
+          installOnly: true
+          config: |
+            { "tokenType": "ossignServer",
+              "ossignServer": { "url": "${{ env.OSSIGN_SERVER }}", "key": "${{ env.OSSIGN_KEY }}",
+                                "metadata": { "dispatch": "${{ inputs.dispatch_id }}", "sha": "${{ inputs.sha }}" } },
+              "timestampUrl": "http://timestamp.acs.microsoft.com/tsa/advanced",
+              "msTimestampUrl": "http://timestamp.acs.microsoft.com/tsa" }
+
+      # [CHANGE ME] Pin the vcpkg tool and ports to the manifest's
+      # builtin-baseline. Upstream clones vcpkg master unpinned.
+      - name: Set up vcpkg at the manifest baseline
+        run: |
+          $baseline = (Get-Content src/vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
+          if ($baseline -notmatch '^[0-9a-f]{40}$') { throw "vcpkg.json has no builtin-baseline commit" }
+          git clone https://github.com/microsoft/vcpkg.git vcpkg
+          git -C vcpkg checkout --detach $baseline
+          if ((git -C vcpkg rev-parse HEAD) -ne $baseline) { throw "vcpkg checkout is not at $baseline" }
+          & vcpkg/bootstrap-vcpkg.bat -disableMetrics
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          "VCPKG_ROOT=$PWD\vcpkg" >> $env:GITHUB_ENV
+
+      - name: Install vcpkg dependencies                         # [CHANGE ME] as upstream
+        working-directory: src
+        run: |
+          & "$env:VCPKG_ROOT/vcpkg.exe" install --triplet x64-windows --clean-after-build
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      # [CHANGE ME] !uninstfinalize needs NSIS 3.08 or later.
+      - name: Install NSIS
+        run: |
+          choco install nsis -y
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $makensis = Get-ChildItem "${env:ProgramFiles(x86)}/NSIS/makensis.exe", "$env:ProgramFiles/NSIS/makensis.exe" -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $makensis) { throw "makensis.exe not found" }
+          $v = & $makensis /VERSION
+          Write-Host "NSIS $v"
+          if ([version]($v -replace '^v', '' -replace '-.*$', '') -lt [version]'3.8') { throw "NSIS $v is older than 3.08" }
+          Split-Path $makensis >> $env:GITHUB_PATH
+
+      # [CHANGE ME] Release versions come from the tag (vX.Y.Z), as upstream
+      # does it; branch builds use the default version in CMakeLists.txt.
+      - name: Configure
+        working-directory: src
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          $versionArgs = @()
+          if ($env:REF -match '^v(\d+(\.\d+){1,3})$') {
+            $versionArgs = @("-DPROJECT_VERSION=$($Matches[1])")
+          }
+          cmake -B build `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCPACK_GENERATOR=NSIS `
+            "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            @versionArgs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Build                                              # [CHANGE ME] as upstream
+        working-directory: src
+        run: |
+          cmake --build build --config Release
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      # [CHANGE ME] Signed in place before CPack copies them into the installer.
+      - name: Sign the executables
+        uses: ossign/ossign@main
+        with:
+          installOnly: false
+          # No config needed, the install step already wrote it
+          inputFiles: |
+            src/build/cli/Release/securepasswd_cli.exe
+            src/build/gui/Release/securepasswd_gui.exe
+
+      # [CHANGE ME] CPack writes CPACK_NSIS_DEFINES at the top level of its NSIS
+      # script; !uninstfinalize signs the uninstaller before makensis embeds it,
+      # which the action cannot reach. A failed signing fails makensis.
+      - name: Package
+        working-directory: src/build
+        run: |
+          $config = "${{ steps.ossign.outputs.configPath }}" -replace '\\', '/'
+          # Written as a CMake string: \" is a literal quote in the NSIS script.
+          $sign = "ossign -c \`"$config\`" -t pecoff -o \`"%1\`" \`"%1\`""
+          "set(CPACK_NSIS_DEFINES `"!uninstfinalize '$sign' = 0`")" | Set-Content -Encoding utf8 ossign-cpack.cmake
+          Get-Content ossign-cpack.cmake
+          cpack -G NSIS -C Release -D "CPACK_PROJECT_CONFIG_FILE=$PWD/ossign-cpack.cmake"
+          if ($LASTEXITCODE) {
+            Get-Content _CPack_Packages/win64/NSIS/NSISOutput.log -ErrorAction SilentlyContinue
+            exit $LASTEXITCODE
+          }
+          $installer = Get-ChildItem SecurePasswd_MGMT-*.exe
+          if (@($installer).Count -ne 1) { throw "Expected one installer, found: $installer" }
+          New-Item -ItemType Directory -Force ../../dist | Out-Null
+          Move-Item $installer "../../dist/$($installer.BaseName)-x64.exe"
+
+      - name: Sign the installer
+        uses: ossign/ossign@main
+        with:
+          installOnly: false
+          inputFiles: dist/*.exe
+
+      # Refuse to publish anything unsigned, signed with a test-mode certificate
+      # (exit code 2) or by the wrong signer. The executables are checked as
+      # extracted from the installer, so this covers what actually ships.
+      - name: Verify signatures
+        run: |
+          $failed = $false
+          foreach ($f in Get-ChildItem dist/*.exe) {
+            ossign verify $f.FullName
+            if ($LASTEXITCODE) { $failed = $true }
+            7z x $f.FullName "-oextract/$($f.BaseName)" -y | Out-Null
+            $exes = Get-ChildItem "extract/$($f.BaseName)" -Recurse -Filter "securepasswd_*.exe"
+            if (@($exes).Count -ne 2) { throw "Expected securepasswd_cli.exe and securepasswd_gui.exe in $($f.Name), found: $exes" }
+            foreach ($e in $exes) {
+              ossign verify $e.FullName
+              if ($LASTEXITCODE) { $failed = $true }
+            }
+          }
+          if ($failed) { exit 1 }
+
+      # [DO NOT CHANGE] Review report bundle, published next to the binaries.
+      - name: Fetch the review report
+        shell: bash
+        run: |
+          OIDC=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$OSSIGN_SERVER" | jq -r .value)
+          mkdir -p review
+          for f in review-report.json review-report.md review-scans.zip review-report.json.p7s; do
+            curl -sS --fail -H "Authorization: Bearer $OIDC" -o "review/$f" \
+              "$OSSIGN_SERVER/api/v1/reviews/${{ inputs.dispatch_id }}/report/$f"
+          done
+
+      - name: Publish release                                    # [OPTIONAL]
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.ref }}-${{ github.run_number }}
+          name: ${{ inputs.release_name }}
+          body_path: review/review-report.md
+          files: |
+            dist/*.exe
+            review/*
