@@ -81,7 +81,7 @@ jobs:
       # secret is involved.
       - name: Install ossign
         id: ossign
-        uses: ossign/ossign@main
+        uses: ossign/ossign@ea2c20939861de6438d5c8740b69c40d81d75786 # 1.4.1
         with:
           installOnly: true
           config: |
@@ -149,7 +149,7 @@ jobs:
 
       # Signed in place before CPack copies them into the installer.
       - name: Sign the executables
-        uses: ossign/ossign@main
+        uses: ossign/ossign@ea2c20939861de6438d5c8740b69c40d81d75786 # 1.4.1
         with:
           installOnly: false
           # No config needed, the install step already wrote it
@@ -157,21 +157,28 @@ jobs:
             src/build/cli/Release/securepasswd_cli.exe
             src/build/gui/Release/securepasswd_gui.exe
 
-      # CPack writes CPACK_NSIS_DEFINES at the top level of its NSIS
-      # script; !uninstfinalize signs the uninstaller before makensis embeds it,
-      # which the action cannot reach. A failed signing fails makensis.
+      # !uninstfinalize signs the uninstaller before makensis embeds it, which
+      # the action cannot reach. A failed signing fails makensis. It goes in
+      # CPACK_NSIS_EXTRA_INSTALL_COMMANDS, not CPACK_NSIS_DEFINES: with more
+      # than one install component (Runtime + Unspecified here) CPack
+      # overwrites CPACK_NSIS_DEFINES and the directive is silently dropped.
       - name: Package
         working-directory: src/build
         run: |
           $config = "${{ steps.ossign.outputs.configPath }}" -replace '\\', '/'
           # Written as a CMake string: \" is a literal quote in the NSIS script.
           $sign = "ossign -c \`"$config\`" -t pecoff -o \`"%1\`" \`"%1\`""
-          "set(CPACK_NSIS_DEFINES `"!uninstfinalize '$sign' = 0`")" | Set-Content -Encoding utf8 ossign-cpack.cmake
+          "set(CPACK_NSIS_EXTRA_INSTALL_COMMANDS `"!uninstfinalize '$sign' = 0`")" | Set-Content -Encoding utf8 ossign-cpack.cmake
           Get-Content ossign-cpack.cmake
           cpack -G NSIS -C Release -D "CPACK_PROJECT_CONFIG_FILE=$PWD/ossign-cpack.cmake"
           if ($LASTEXITCODE) {
             Get-Content _CPack_Packages/win64/NSIS/NSISOutput.log -ErrorAction SilentlyContinue
             exit $LASTEXITCODE
+          }
+          # cpack hides makensis output (NSISOutput.log only exists on failure),
+          # so check the generated script still carries the directive.
+          if (-not (Select-String -Path _CPack_Packages/*/NSIS/project.nsi -Pattern '!uninstfinalize' -SimpleMatch)) {
+            throw "!uninstfinalize is missing from project.nsi; the uninstaller would ship unsigned"
           }
           $installer = Get-ChildItem SecurePasswd_MGMT-*.exe
           if (@($installer).Count -ne 1) { throw "Expected one installer, found: $installer" }
@@ -179,14 +186,15 @@ jobs:
           Move-Item $installer "../../dist/$($installer.BaseName)-x64.exe"
 
       - name: Sign the installer
-        uses: ossign/ossign@main
+        uses: ossign/ossign@ea2c20939861de6438d5c8740b69c40d81d75786 # 1.4.1
         with:
           installOnly: false
           inputFiles: dist/*.exe
 
       # Refuse to publish anything unsigned, signed with a test-mode certificate
       # (exit code 2) or by the wrong signer. The executables are checked as
-      # extracted from the installer, so this covers what actually ships.
+      # extracted from the installer and the uninstaller as installed, so this
+      # covers what actually ships.
       - name: Verify signatures
         run: |
           $failed = $false
@@ -200,6 +208,13 @@ jobs:
               ossign verify $e.FullName
               if ($LASTEXITCODE) { $failed = $true }
             }
+            # 7z can't extract the uninstaller from this installer; install
+            # it silently (throwaway runner) and verify the Uninstall.exe it writes.
+            $inst = "$PWD\inst\$($f.BaseName)"
+            Start-Process $f.FullName -ArgumentList '/S', "/D=$inst" -Wait
+            if (-not (Test-Path "$inst/Uninstall.exe")) { throw "No Uninstall.exe after installing $($f.Name)" }
+            ossign verify "$inst/Uninstall.exe"
+            if ($LASTEXITCODE) { $failed = $true }
           }
           if ($failed) { exit 1 }
 
@@ -216,7 +231,7 @@ jobs:
           done
 
       - name: Publish release                                    # [OPTIONAL]
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ inputs.ref }}-${{ github.run_number }}
           name: ${{ inputs.release_name }}
